@@ -1,62 +1,54 @@
 <#
 .SYNOPSIS
-  Run any PowerShell script in a fresh process (no profile) with deterministic module versions.
+  Run PowerShell in a fresh process (no profile) with deterministic module versions.
 
 .DESCRIPTION
-  Invoke-IsolatedScript launches a brand-new PowerShell host and (optionally):
-    • Honors versions declared via   #requires -Modules
-    • Adds/overrides module requirements you pass in
-    • Prepends a “vendored” Modules folder (from Save-Module)
-    • (Optional) installs missing modules from PSGallery (CurrentUser)
-    • Pre-imports and verifies requested module versions
-  This avoids version bleed (e.g., different Microsoft.Graph.* versions).
+  This module provides three helpers:
+    • Invoke-IsolatedScript   — run a .ps1 in a clean child process.
+    • Invoke-IsolatedCommand  — run a single command in a clean child (supports -CommandSplat).
+    • Invoke-IsolatedSequence — run multiple statements in one clean child (writes a temp .ps1).
 
-.INSTALL (user scope)
-  Save as:
-    PowerShell 7+:   $HOME\Documents\PowerShell\Modules\IsolatedScript\1.0.0\IsolatedScript.psm1
-    Windows PS 5.1:  $HOME\Documents\WindowsPowerShell\Modules\IsolatedScript\1.0.0\IsolatedScript.psm1
-  Create a manifest exporting Invoke-IsolatedScript and Invoke-IsolatedCommand
-  (or keep Export-ModuleMember below).
+  Features
+    • Honors #requires -Modules (scripts).
+    • Lets you add/override module requirements (exact or ranges).
+    • Pins exact versions by importing the specific module manifest path.
+    • Optional Install-If-Missing from PSGallery (CurrentUser).
+    • VendoredModulesPath to prepend a minimal module cache.
+    • PS 5.1 + PS 7+ compatible (JSON parsing fallback).
+    • Pre-imports Microsoft.PowerShell.* core modules in the child so Join-Path, etc. work.
+
+.INSTALL
+  Save this file as:
+    PS 7+:   $HOME\Documents\PowerShell\Modules\IsolatedScript\1.0.0\IsolatedScript.psm1
+    PS 5.1:  $HOME\Documents\WindowsPowerShell\Modules\IsolatedScript\1.0.0\IsolatedScript.psm1
+  Ensure your manifest exports: Invoke-IsolatedScript, Invoke-IsolatedCommand, Invoke-IsolatedSequence
 
 .QUICK START (scripts)
-  Import-Module IsolatedScript
-  Invoke-IsolatedScript -ScriptPath .\MyScript.ps1                       # honor #requires
+  Invoke-IsolatedScript -ScriptPath .\MyScript.ps1
   Invoke-IsolatedScript -ScriptPath .\MyScript.ps1 `
     -ModuleRequirement @(@{ Name='Microsoft.Graph.Authentication'; RequiredVersion='2.31.0' }) `
     -ConflictPolicy ExternalWins
   Invoke-IsolatedScript -ScriptPath .\MyScript.ps1 -VendoredModulesPath "$PSScriptRoot\Modules"
 
-.QUICK START (commands / no .ps1)
-  # Use parameter splatting (recommended)
+.QUICK START (single command)
   Invoke-IsolatedCommand -CommandName Invoke-ZTAssessment `
     -PreloadModules @('ZeroTrustAssessmentV2') -EnableAutoload `
     -ModuleRequirement @(@{ Name='Microsoft.Graph.Authentication'; RequiredVersion='2.2.0' }) `
     -CommandSplat @{ Interactive = $true; Days = 1 }
 
-  # Or pass tokens explicitly
-  Invoke-IsolatedCommand -CommandName Invoke-ZTAssessment `
-    -PreloadModules @('ZeroTrustAssessmentV2') -EnableAutoload `
-    -ModuleRequirement @(@{ Name='Microsoft.Graph.Authentication'; RequiredVersion='2.2.0' }) `
-    -CommandArgs @('-Interactive','-Days','1')
-
-.PARAMETERS (key ones)
-  -ScriptPath / -CommandName   Entry point (script or command).
-  -ScriptArgs / -CommandArgs   Array of tokens to pass through.
-  -CommandSplat                Hashtable of parameters to splat to the command (commands only).
-  -ModuleRequirement           Array of hashtables describing module pins/ranges:
-                                 @{ Name='Module'; RequiredVersion='x.y.z' }
-                                 @{ Name='Module'; MinimumVersion='x'; MaximumVersion='y' }
-  -ConflictPolicy              ScriptWins (default) | ExternalWins            (scripts only)
-  -PreloadModules              Modules to import before invoking the command  (commands only)
-  -VendoredModulesPath         Prepend this folder to PSModulePath in the child process.
-  -InstallIfMissing            Install any missing requested modules from PSGallery (CurrentUser).
-  -EnableAutoload              Allow implicit autoload (default: off for determinism).
-  -IgnoreScriptRequires        Ignore the script’s #requires -Modules.        (scripts only)
-  -PwshPath                    Host to launch. If omitted, auto-picks pwsh (7+) or powershell (5.1).
+.QUICK START (sequence in one process)
+  Invoke-IsolatedSequence `
+    -Statements @(
+      "Connect-MgGraph -UseDeviceCode -Scopes 'User.Read.All' -TenantId 'contoso.onmicrosoft.com' -ContextScope Process",
+      "Invoke-ZTAssessment -Interactive -Days 1"
+    ) `
+    -VendoredModulesPath "$PSScriptRoot\Modules-ZT-Graph220" `
+    -PreloadModules @('ZeroTrustAssessmentV2') `
+    -EnableAutoload `
+    -ModuleRequirement @(@{ Name='Microsoft.Graph.Authentication'; RequiredVersion='2.2.0' })
 
 .NOTES
   The child runs with: -NoLogo -NoProfile -ExecutionPolicy Bypass
-  Core modules are imported explicitly so cmdlets like Join-Path work even with autoload off.
 #>
 
 function Invoke-IsolatedScript {
@@ -79,14 +71,10 @@ function Invoke-IsolatedScript {
 
   # Auto-select child host if caller didn’t specify one (pwsh → fallback to powershell 5.1)
   if (-not $PSBoundParameters.ContainsKey('PwshPath')) {
-    if (Get-Command pwsh -ErrorAction SilentlyContinue) {
-      $PwshPath = 'pwsh'
-    } else {
-      $PwshPath = 'powershell'
-    }
+    if (Get-Command pwsh -ErrorAction SilentlyContinue) { $PwshPath = 'pwsh' } else { $PwshPath = 'powershell' }
   }
 
-  # --- Parse #requires -Modules from the script ---
+  # Parse #requires -Modules from the script
   function Get-RequiresModules {
     param([string]$Path)
     $text = Get-Content -LiteralPath $Path -Raw
@@ -147,7 +135,7 @@ function Invoke-IsolatedScript {
   $payload = @{
     ScriptPath    = $resolvedScript
     ScriptArgs    = $ScriptArgs
-    Requirements  = $finalReqs        # array of hashtables
+    Requirements  = $finalReqs
     Vendored      = $VendoredModulesPath
     Install       = [bool]$InstallIfMissing
     Autoload      = [bool]$EnableAutoload
@@ -175,10 +163,8 @@ function ConvertTo-HashtableDeep($input) {
 }
 
 try {
-  # PS7+ path
   $cfg = $raw | ConvertFrom-Json -AsHashtable
 } catch {
-  # PS5.1 fallback
   $cfg = ConvertTo-HashtableDeep ($raw | ConvertFrom-Json)
 }
 
@@ -200,12 +186,11 @@ function Import-Exact([hashtable]$r) {
   $ver = if ($r.ContainsKey('RequiredVersion')) { $r.RequiredVersion } elseif ($r.ContainsKey('ModuleVersion')) { $r.ModuleVersion } else { $null }
 
   if ($ver) {
-    # Find the requested version on disk and import that specific manifest/module file
+    # Import the specific manifest/module path for that version
     $target = Get-Module -ListAvailable -Name $name |
               Where-Object { $_.Version -eq [version]$ver } |
               Select-Object -First 1
     if (-not $target) { throw "Requested $name $ver not found on PSModulePath." }
-
     Import-Module -Name $target.Path -Force -ErrorAction Stop
   }
   elseif ($r.MinimumVersion -or $r.MaximumVersion) {
@@ -218,7 +203,7 @@ function Import-Exact([hashtable]$r) {
     Import-Module $name -ErrorAction Stop
   }
 
-  # Verify loaded version satisfies the constraint
+  # Verify the loaded version satisfies the constraint
   $loaded = Get-Module -Name $name | Select-Object -First 1
   if (-not $loaded) { throw "Failed to import module $name" }
   if ($r.ContainsKey('RequiredVersion') -and $loaded.Version -ne [version]$r.RequiredVersion) { throw "Loaded $name $($loaded.Version), wanted $($r.RequiredVersion)" }
@@ -270,7 +255,6 @@ $args = if ($cfg.ScriptArgs) { $cfg.ScriptArgs } else { @() }
   & $PwshPath -NoLogo -NoProfile -ExecutionPolicy Bypass -EncodedCommand $childEnc
 }
 
-# Run a single command (e.g., Connect/Invoke-ZTAssessment) in a fresh child with pinned modules
 function Invoke-IsolatedCommand {
   [CmdletBinding()]
   param(
@@ -339,7 +323,6 @@ function Import-Exact([hashtable]$r) {
   $name = $r.Name
   if (-not $name) { throw 'Requirement missing Name' }
 
-  # Exact pin (RequiredVersion or ModuleVersion)
   $ver = if ($r.ContainsKey('RequiredVersion')) { $r.RequiredVersion } elseif ($r.ContainsKey('ModuleVersion')) { $r.ModuleVersion } else { $null }
 
   if ($ver) {
@@ -359,7 +342,6 @@ function Import-Exact([hashtable]$r) {
     Import-Module $name -ErrorAction Stop
   }
 
-  # Verify
   $loaded = Get-Module -Name $name | Select-Object -First 1
   if (-not $loaded) { throw "Failed to import module $name" }
   if ($r.ContainsKey('RequiredVersion') -and $loaded.Version -ne [version]$r.RequiredVersion) { throw "Loaded $name $($loaded.Version), wanted $($r.RequiredVersion)" }
@@ -394,7 +376,7 @@ if ($cfg.Install -and $cfg.Requirements -and $cfg.Requirements.Count -gt 0) {
   }
 }
 
-# Pin/import requested modules FIRST (e.g., exact Graph.Auth), then preload any other module(s)
+# Pin/import requested modules FIRST, then preload any other module(s)
 if ($cfg.Requirements -and $cfg.Requirements.Count -gt 0) {
   foreach ($r in $cfg.Requirements) { Import-Exact $r }
 }
@@ -419,4 +401,61 @@ if ($splat -and $splat.Count -gt 0) {
   & $PwshPath -NoLogo -NoProfile -ExecutionPolicy Bypass -EncodedCommand $childEnc
 }
 
-Export-ModuleMember -Function Invoke-IsolatedScript,Invoke-IsolatedCommand
+function Invoke-IsolatedSequence {
+  [CmdletBinding()]
+  param(
+    [Parameter(Mandatory, Position=0)]
+    [string[]] $Statements,                         # Lines to run in order, in one child process
+
+    [hashtable[]] $ModuleRequirement,               # e.g., @{Name='Microsoft.Graph.Authentication'; RequiredVersion='2.2.0'}
+    [string[]]   $PreloadModules,                   # e.g., 'ZeroTrustAssessmentV2'
+    [string]     $VendoredModulesPath,              # e.g., "$PSScriptRoot\Modules-ZT-Graph220"
+
+    [switch] $InstallIfMissing,
+    [switch] $EnableAutoload,
+    [string] $PwshPath,                             # auto-picks pwsh or powershell if omitted
+    [string] $WorkingDirectory,                     # starting directory inside the child
+    [switch] $KeepTemp                              # keep the generated temp .ps1 for inspection
+  )
+
+  # Auto-select child host if not specified
+  if (-not $PSBoundParameters.ContainsKey('PwshPath')) {
+    if (Get-Command pwsh -ErrorAction SilentlyContinue) { $PwshPath = 'pwsh' } else { $PwshPath = 'powershell' }
+  }
+
+  # Build the temporary script
+  $tmp = Join-Path ([IO.Path]::GetTempPath()) ("iso-seq-" + [guid]::NewGuid().ToString('N') + ".ps1")
+  $utf8NoBom = New-Object System.Text.UTF8Encoding($false)
+
+  $lines = New-Object System.Collections.Generic.List[string]
+  $lines.Add("# generated by Invoke-IsolatedSequence $(Get-Date -Format o)")
+  if ($WorkingDirectory) {
+    $escaped = $WorkingDirectory.Replace('"','""')
+    $lines.Add("Set-Location -LiteralPath `"$escaped`"")
+  }
+  if ($PreloadModules) {
+    foreach ($m in $PreloadModules) { $lines.Add("Import-Module $m -ErrorAction Stop") }
+  }
+  foreach ($s in $Statements) { $lines.Add($s) }
+
+  [IO.File]::WriteAllLines($tmp, $lines, $utf8NoBom)
+
+  try {
+    Invoke-IsolatedScript -ScriptPath $tmp `
+      -ModuleRequirement $ModuleRequirement `
+      -VendoredModulesPath $VendoredModulesPath `
+      -InstallIfMissing:$InstallIfMissing `
+      -EnableAutoload:$EnableAutoload `
+      -PwshPath $PwshPath
+  }
+  finally {
+    if (-not $KeepTemp) {
+      Remove-Item -LiteralPath $tmp -Force -ErrorAction SilentlyContinue
+    } else {
+      Write-Verbose "Temp script kept at $tmp"
+      $tmp
+    }
+  }
+}
+
+Export-ModuleMember -Function Invoke-IsolatedScript,Invoke-IsolatedCommand,Invoke-IsolatedSequence
