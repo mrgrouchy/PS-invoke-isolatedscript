@@ -27,26 +27,32 @@
   Invoke-IsolatedScript -ScriptPath .\MyScript.ps1 -VendoredModulesPath "$PSScriptRoot\Modules"
 
 .QUICK START (commands / no .ps1)
-  # Run a command like Connect-ZTAssessment in a clean child process, pinning Graph.Auth
-  Invoke-IsolatedCommand -CommandName 'Connect-ZTAssessment' `
-    -CommandArgs @('-TenantId','contoso.onmicrosoft.com') `
-    -ModuleRequirement @(@{ Name='Microsoft.Graph.Authentication'; RequiredVersion='2.30.0' }) `
-    -PreloadModules @('ZTAssessment')
+  # Use parameter splatting (recommended)
+  Invoke-IsolatedCommand -CommandName Invoke-ZTAssessment `
+    -PreloadModules @('ZeroTrustAssessmentV2') -EnableAutoload `
+    -ModuleRequirement @(@{ Name='Microsoft.Graph.Authentication'; RequiredVersion='2.2.0' }) `
+    -CommandSplat @{ Interactive = $true; Days = 1 }
+
+  # Or pass tokens explicitly
+  Invoke-IsolatedCommand -CommandName Invoke-ZTAssessment `
+    -PreloadModules @('ZeroTrustAssessmentV2') -EnableAutoload `
+    -ModuleRequirement @(@{ Name='Microsoft.Graph.Authentication'; RequiredVersion='2.2.0' }) `
+    -CommandArgs @('-Interactive','-Days','1')
 
 .PARAMETERS (key ones)
-  -ScriptPath            Path to the script you want to run.            (Invoke-IsolatedScript)
-  -CommandName           Command to run (e.g., Connect-ZTAssessment).   (Invoke-IsolatedCommand)
-  -ScriptArgs/CommandArgs  Array of args to pass through.
-  -ModuleRequirement     Array of hashtables describing extra/override modules:
-                           @{ Name='Module'; RequiredVersion='x.y.z' }
-                           @{ Name='Module'; MinimumVersion='x'; MaximumVersion='y' }
-  -ConflictPolicy        ScriptWins (default) | ExternalWins            (scripts only)
-  -PreloadModules        Modules to import before invoking the command  (commands only)
-  -VendoredModulesPath   Prepend this folder to PSModulePath in the child process.
-  -InstallIfMissing      If set, install any missing requested modules from PSGallery.
-  -EnableAutoload        Allow implicit autoload (default: off for determinism).
-  -IgnoreScriptRequires  Ignore the script’s #requires -Modules.        (scripts only)
-  -PwshPath              Host to launch. If omitted, auto-picks pwsh (7+) or powershell (5.1).
+  -ScriptPath / -CommandName   Entry point (script or command).
+  -ScriptArgs / -CommandArgs   Array of tokens to pass through.
+  -CommandSplat                Hashtable of parameters to splat to the command (commands only).
+  -ModuleRequirement           Array of hashtables describing module pins/ranges:
+                                 @{ Name='Module'; RequiredVersion='x.y.z' }
+                                 @{ Name='Module'; MinimumVersion='x'; MaximumVersion='y' }
+  -ConflictPolicy              ScriptWins (default) | ExternalWins            (scripts only)
+  -PreloadModules              Modules to import before invoking the command  (commands only)
+  -VendoredModulesPath         Prepend this folder to PSModulePath in the child process.
+  -InstallIfMissing            Install any missing requested modules from PSGallery (CurrentUser).
+  -EnableAutoload              Allow implicit autoload (default: off for determinism).
+  -IgnoreScriptRequires        Ignore the script’s #requires -Modules.        (scripts only)
+  -PwshPath                    Host to launch. If omitted, auto-picks pwsh (7+) or powershell (5.1).
 
 .NOTES
   The child runs with: -NoLogo -NoProfile -ExecutionPolicy Bypass
@@ -80,7 +86,7 @@ function Invoke-IsolatedScript {
     }
   }
 
-  # --- Parse #requires -Modules from the script (names or @{ ModuleName='X'; ModuleVersion='1.2.3' }) ---
+  # --- Parse #requires -Modules from the script ---
   function Get-RequiresModules {
     param([string]$Path)
     $text = Get-Content -LiteralPath $Path -Raw
@@ -90,7 +96,6 @@ function Invoke-IsolatedScript {
       $val = $m.Groups[1].Value.Trim()
 
       if ($val -like '@{*') {
-        # Hashtable entries separated by '},'
         $parts = [regex]::Split($val, '\}\s*,') | ForEach-Object { $_.Trim(" ,`r`n") }
         foreach ($p in $parts) {
           if ($p -notmatch '@\{') { continue }
@@ -204,14 +209,12 @@ function Import-Exact([hashtable]$r) {
     Import-Module -Name $target.Path -Force -ErrorAction Stop
   }
   elseif ($r.MinimumVersion -or $r.MaximumVersion) {
-    # Version range: let Import-Module pick a matching one, then verify
     $p = @{}
     if ($r.MinimumVersion) { $p.MinimumVersion = $r.MinimumVersion }
     if ($r.MaximumVersion) { $p.MaximumVersion = $r.MaximumVersion }
     Import-Module $name @p -ErrorAction Stop
   }
   else {
-    # No version provided: import whatever is first on PSModulePath
     Import-Module $name -ErrorAction Stop
   }
 
@@ -267,12 +270,13 @@ $args = if ($cfg.ScriptArgs) { $cfg.ScriptArgs } else { @() }
   & $PwshPath -NoLogo -NoProfile -ExecutionPolicy Bypass -EncodedCommand $childEnc
 }
 
-# NEW: Run a single command (e.g., Connect-ZTAssessment) in a fresh child with pinned modules
+# Run a single command (e.g., Connect/Invoke-ZTAssessment) in a fresh child with pinned modules
 function Invoke-IsolatedCommand {
   [CmdletBinding()]
   param(
     [Parameter(Mandatory)] [string]$CommandName,
     [string[]] $CommandArgs,
+    [hashtable] $CommandSplat,
     [hashtable[]] $ModuleRequirement,
     [string[]] $PreloadModules,
     [string] $VendoredModulesPath,
@@ -294,6 +298,7 @@ function Invoke-IsolatedCommand {
   $payload = @{
     CommandName  = $CommandName
     CommandArgs  = $CommandArgs
+    CommandSplat = $CommandSplat
     Requirements = $ModuleRequirement
     PreloadMods  = $PreloadModules
     Vendored     = $VendoredModulesPath
@@ -398,9 +403,15 @@ if ($cfg.PreloadMods -and $cfg.PreloadMods.Count -gt 0) {
 }
 
 # Finally, run the command
-$cmd = $cfg.CommandName
-$args = if ($cfg.CommandArgs) { $cfg.CommandArgs } else { @() }
-& $cmd @args
+$cmd   = $cfg.CommandName
+$args  = if ($cfg.CommandArgs) { $cfg.CommandArgs } else { @() }
+$splat = $cfg.CommandSplat
+
+if ($splat -and $splat.Count -gt 0) {
+  & $cmd @splat
+} else {
+  & $cmd @args
+}
 '@
 
   $child = $child.Replace('__PAYLOAD__', $payloadEnc)
