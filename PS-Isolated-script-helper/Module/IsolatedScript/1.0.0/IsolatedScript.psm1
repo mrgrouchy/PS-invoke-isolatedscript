@@ -198,6 +198,8 @@ function Invoke-IsolatedScript {
   # 4) Child bootstrap (single-quoted; replace token to avoid premature expansion)
   $child = @'
 $ErrorActionPreference = 'Stop'
+# Reset any default parameter values in this clean process
+$PSDefaultParameterValues = @{}
 
 $raw = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('__PAYLOAD__'))
 
@@ -296,9 +298,13 @@ if ($cfg.Requirements -and $cfg.Requirements.Count -gt 0) {
   foreach ($r in $cfg.Requirements) { Import-Exact $r }
 }
 
-# Run the target script
-$args = if ($cfg.ScriptArgs) { $cfg.ScriptArgs } else { @() }
-& $cfg.ScriptPath @args
+# Run the target script (avoid the special $args auto-variable)
+$argv = if ($cfg.ScriptArgs) { @($cfg.ScriptArgs) } else { @() }
+if ($argv.Count -gt 0) {
+  & $cfg.ScriptPath @argv
+} else {
+  & $cfg.ScriptPath
+}
 '@
 
   $child = $child.Replace('__PAYLOAD__', $payloadEnc)
@@ -472,8 +478,11 @@ if ($cfg.PreloadMods -and $cfg.PreloadMods.Count -gt 0) {
 }
 
 # Finally, run the command (with sanitized splat)
+# Prevent inherited default params from forcing things like Get-Date -Date $null
+$PSDefaultParameterValues = @{}
+
 $cmd   = $cfg.CommandName
-$args  = if ($cfg.CommandArgs) { $cfg.CommandArgs } else { @() }
+$argv  = if ($cfg.CommandArgs) { @($cfg.CommandArgs) } else { @() }
 $splat = $cfg.CommandSplat
 
 # Drop null / empty entries from the splat to avoid binding errors like: Get-Date -Date $null
@@ -489,8 +498,10 @@ if ($splat -is [System.Collections.IDictionary]) {
 
 if ($clean.Count -gt 0) {
   & $cmd @clean
+} elseif ($argv.Count -gt 0) {
+  & $cmd @argv
 } else {
-  & $cmd @args
+  & $cmd
 }
 '@
 
