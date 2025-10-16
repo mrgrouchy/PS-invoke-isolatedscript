@@ -4,9 +4,12 @@
 
 .DESCRIPTION
   This module provides three helpers:
-    • Invoke-IsolatedScript   — run a .ps1 in a clean child process.
-    • Invoke-IsolatedCommand  — run a single command in a clean child (supports -CommandSplat).
-    • Invoke-IsolatedSequence — run multiple statements in one clean child (writes a temp .ps1).
+    • Invoke-IsolatedScript   — run a .ps1 in a NEW, clean PowerShell process.
+    • Invoke-IsolatedCommand  — run ONE command in a NEW, clean PowerShell process (supports -CommandSplat).
+    • Invoke-IsolatedSequence — run MULTIPLE commands in the SAME clean process (writes a temp .ps1 behind the scenes).
+
+  Why? To eliminate "module bleed" and version conflicts (e.g., different Microsoft.Graph.* versions),
+  to pin exact module versions, and to keep auth contexts (like Connect-MgGraph) scoped to the child.
 
   Features
     • Honors #requires -Modules (scripts).
@@ -21,22 +24,34 @@
   Save this file as:
     PS 7+:   $HOME\Documents\PowerShell\Modules\IsolatedScript\1.0.0\IsolatedScript.psm1
     PS 5.1:  $HOME\Documents\WindowsPowerShell\Modules\IsolatedScript\1.0.0\IsolatedScript.psm1
-  Ensure your manifest exports: Invoke-IsolatedScript, Invoke-IsolatedCommand, Invoke-IsolatedSequence
+  Update your manifest to export:
+    FunctionsToExport = 'Invoke-IsolatedScript','Invoke-IsolatedCommand','Invoke-IsolatedSequence'
 
-.QUICK START (scripts)
+.SAMPLES (copy/paste)
+  # --- Run a .ps1, honoring its #requires -Modules ---
   Invoke-IsolatedScript -ScriptPath .\MyScript.ps1
-  Invoke-IsolatedScript -ScriptPath .\MyScript.ps1 `
-    -ModuleRequirement @(@{ Name='Microsoft.Graph.Authentication'; RequiredVersion='2.31.0' }) `
-    -ConflictPolicy ExternalWins
-  Invoke-IsolatedScript -ScriptPath .\MyScript.ps1 -VendoredModulesPath "$PSScriptRoot\Modules"
 
-.QUICK START (single command)
+  # --- Run a .ps1 but pin Graph.Auth exactly (no bleed) ---
+  Invoke-IsolatedScript -ScriptPath .\MyScript.ps1 `
+    -ModuleRequirement @(@{ Name='Microsoft.Graph.Authentication'; RequiredVersion='2.31.0' })
+
+  # --- Use a vendored modules cache (only what you saved is visible to the child) ---
+  $vend = "$PSScriptRoot\Modules"
+  Invoke-IsolatedScript -ScriptPath .\MyScript.ps1 -VendoredModulesPath $vend -EnableAutoload
+
+  # --- Run a single command (no .ps1): Invoke-ZTAssessment with Graph.Auth 2.2.0 and a switch ---
   Invoke-IsolatedCommand -CommandName Invoke-ZTAssessment `
     -PreloadModules @('ZeroTrustAssessmentV2') -EnableAutoload `
     -ModuleRequirement @(@{ Name='Microsoft.Graph.Authentication'; RequiredVersion='2.2.0' }) `
     -CommandSplat @{ Interactive = $true; Days = 1 }
 
-.QUICK START (sequence in one process)
+  # --- Connect-MgGraph (device code), inside isolated child, then exit (single command) ---
+  Invoke-IsolatedCommand -CommandName Connect-MgGraph `
+    -EnableAutoload `
+    -ModuleRequirement @(@{ Name='Microsoft.Graph.Authentication'; RequiredVersion='2.2.0' }) `
+    -CommandArgs @('-UseDeviceCode','-Scopes','User.Read.All','-TenantId','contoso.onmicrosoft.com','-ContextScope','Process')
+
+  # --- Run multiple commands in the SAME child (preserve Graph context) ---
   Invoke-IsolatedSequence `
     -Statements @(
       "Connect-MgGraph -UseDeviceCode -Scopes 'User.Read.All' -TenantId 'contoso.onmicrosoft.com' -ContextScope Process",
@@ -48,9 +63,47 @@
     -ModuleRequirement @(@{ Name='Microsoft.Graph.Authentication'; RequiredVersion='2.2.0' })
 
 .NOTES
-  The child runs with: -NoLogo -NoProfile -ExecutionPolicy Bypass
+  • Each Invoke-IsolatedCommand call is a NEW process (context doesn’t persist).
+    Use Invoke-IsolatedSequence to run multiple commands in ONE process.
+  • If you see “parameter could not be found that accepts argument '-'”, ensure -CommandArgs is an ARRAY
+    of strings (each token separate), or use -CommandSplat (recommended).
+  • If you hit “assembly with the same name is already loaded”, vendor only the versions you need and pass
+    -VendoredModulesPath so the child can’t see other versions.
 #>
 
+<#
+.SYNOPSIS
+  Run a .ps1 in a fresh PowerShell process with deterministic module versions.
+.DESCRIPTION
+  Launches a brand-new PowerShell host (pwsh or powershell) with -NoProfile and executes the script.
+  Honors your script’s #requires -Modules and/or any -ModuleRequirement pins you pass. Supports vendored
+  module path, install-if-missing, and turns off autoload by default for determinism.
+.PARAMETER ScriptPath
+  Path to the .ps1 file to execute.
+.PARAMETER ScriptArgs
+  Array of arguments to pass to your script (tokens).
+.PARAMETER ModuleRequirement
+  Array of hashtables describing required modules and versions (exact or ranges).
+  Examples:
+    @{ Name='Microsoft.Graph.Authentication'; RequiredVersion='2.2.0' }
+    @{ Name='PnP.PowerShell'; MinimumVersion='2.4.0' }
+.PARAMETER ConflictPolicy
+  ScriptWins (default) or ExternalWins for merging #requires with ModuleRequirement.
+.PARAMETER VendoredModulesPath
+  Folder prepended to PSModulePath for the child (e.g., output of Save-Module).
+.PARAMETER InstallIfMissing
+  If set, Install-Module missing requirements to CurrentUser inside the child.
+.PARAMETER EnableAutoload
+  Allow automatic module autoloading in the child (default disabled).
+.PARAMETER IgnoreScriptRequires
+  Ignore #requires -Modules in the script and ONLY use -ModuleRequirement.
+.PARAMETER PwshPath
+  Host to launch. If omitted, auto-picks pwsh (7+) then powershell (5.1).
+.EXAMPLE
+  Invoke-IsolatedScript -ScriptPath .\Test-GraphAuth-230.ps1
+.EXAMPLE
+  Invoke-IsolatedScript -ScriptPath .\My.ps1 -VendoredModulesPath "$PSScriptRoot\Modules" -EnableAutoload
+#>
 function Invoke-IsolatedScript {
   [CmdletBinding()]
   param(
@@ -255,6 +308,40 @@ $args = if ($cfg.ScriptArgs) { $cfg.ScriptArgs } else { @() }
   & $PwshPath -NoLogo -NoProfile -ExecutionPolicy Bypass -EncodedCommand $childEnc
 }
 
+<#
+.SYNOPSIS
+  Run ONE command (no .ps1) in a fresh, isolated process.
+.DESCRIPTION
+  Launches a brand-new PowerShell host (pwsh or powershell) with -NoProfile, optionally pins module versions,
+  preloads modules, and then invokes the command. Use -CommandSplat for unambiguous parameter passing.
+.PARAMETER CommandName
+  The command to run (e.g., Connect-MgGraph, Invoke-ZTAssessment).
+.PARAMETER CommandArgs
+  Array of tokens (strings) to pass positionally (e.g., @('-Interactive','-Days','1')).
+.PARAMETER CommandSplat
+  Hashtable of parameters to splat to the command (recommended).
+.PARAMETER ModuleRequirement
+  Array of hashtables describing modules to pin (exact or ranges).
+.PARAMETER PreloadModules
+  Modules to Import-Module before running the command (load-order control).
+.PARAMETER VendoredModulesPath
+  Folder prepended to PSModulePath for the child (e.g., a Save-Module cache).
+.PARAMETER InstallIfMissing
+  Install missing requirements to CurrentUser inside the child.
+.PARAMETER EnableAutoload
+  Allow automatic module autoloading in the child (default disabled).
+.PARAMETER PwshPath
+  Host to launch. If omitted, auto-picks pwsh (7+) then powershell (5.1).
+.PARAMETER WorkingDirectory
+  Starting directory inside the child process.
+.EXAMPLE
+  Invoke-IsolatedCommand -CommandName Invoke-ZTAssessment `
+    -PreloadModules @('ZeroTrustAssessmentV2') -EnableAutoload `
+    -ModuleRequirement @(@{ Name='Microsoft.Graph.Authentication'; RequiredVersion='2.2.0' }) `
+    -CommandSplat @{ Interactive = $true; Days = 1 }
+.EXAMPLE
+  Invoke-IsolatedCommand -CommandName Get-Date -CommandArgs @('-Format','o')
+#>
 function Invoke-IsolatedCommand {
   [CmdletBinding()]
   param(
@@ -384,13 +471,24 @@ if ($cfg.PreloadMods -and $cfg.PreloadMods.Count -gt 0) {
   foreach ($m in $cfg.PreloadMods) { try { Import-Module $m -ErrorAction Stop } catch {} }
 }
 
-# Finally, run the command
+# Finally, run the command (with sanitized splat)
 $cmd   = $cfg.CommandName
 $args  = if ($cfg.CommandArgs) { $cfg.CommandArgs } else { @() }
 $splat = $cfg.CommandSplat
 
-if ($splat -and $splat.Count -gt 0) {
-  & $cmd @splat
+# Drop null / empty entries from the splat to avoid binding errors like: Get-Date -Date $null
+$clean = @{}
+if ($splat -is [System.Collections.IDictionary]) {
+  foreach ($k in $splat.Keys) {
+    $v = $splat[$k]
+    if ($null -ne $v -and -not ($v -is [string] -and $v.Trim() -eq '')) {
+      $clean[$k] = $v
+    }
+  }
+}
+
+if ($clean.Count -gt 0) {
+  & $cmd @clean
 } else {
   & $cmd @args
 }
@@ -401,21 +499,56 @@ if ($splat -and $splat.Count -gt 0) {
   & $PwshPath -NoLogo -NoProfile -ExecutionPolicy Bypass -EncodedCommand $childEnc
 }
 
+<#
+.SYNOPSIS
+  Run MULTIPLE statements in ONE fresh, isolated process (preserves context between lines).
+.DESCRIPTION
+  Writes a temporary .ps1 with your statements, then calls Invoke-IsolatedScript so all version
+  pinning and vendored path logic applies. Perfect for: Connect-MgGraph then Invoke-ZTAssessment.
+.PARAMETER Statements
+  Array of lines (strings) to execute in order in the child.
+.PARAMETER ModuleRequirement
+  Array of hashtables describing modules to pin (exact or ranges).
+.PARAMETER PreloadModules
+  Modules to Import-Module before running your statements.
+.PARAMETER VendoredModulesPath
+  Folder prepended to PSModulePath for the child (e.g., a Save-Module cache).
+.PARAMETER InstallIfMissing
+  Install missing requirements to CurrentUser inside the child.
+.PARAMETER EnableAutoload
+  Allow automatic module autoloading in the child (default disabled).
+.PARAMETER PwshPath
+  Host to launch. If omitted, auto-picks pwsh (7+) then powershell (5.1).
+.PARAMETER WorkingDirectory
+  Starting directory inside the child process.
+.PARAMETER KeepTemp
+  If set, keep the generated temp .ps1 (path is written to output).
+.EXAMPLE
+  Invoke-IsolatedSequence `
+    -Statements @(
+      "Connect-MgGraph -UseDeviceCode -Scopes 'User.Read.All' -TenantId 'contoso.onmicrosoft.com' -ContextScope Process",
+      "Invoke-ZTAssessment -Interactive -Days 1"
+    ) `
+    -VendoredModulesPath "$PSScriptRoot\Modules-ZT-Graph220" `
+    -PreloadModules @('ZeroTrustAssessmentV2') `
+    -EnableAutoload `
+    -ModuleRequirement @(@{ Name='Microsoft.Graph.Authentication'; RequiredVersion='2.2.0' })
+#>
 function Invoke-IsolatedSequence {
   [CmdletBinding()]
   param(
     [Parameter(Mandatory, Position=0)]
-    [string[]] $Statements,                         # Lines to run in order, in one child process
+    [string[]] $Statements,
 
-    [hashtable[]] $ModuleRequirement,               # e.g., @{Name='Microsoft.Graph.Authentication'; RequiredVersion='2.2.0'}
-    [string[]]   $PreloadModules,                   # e.g., 'ZeroTrustAssessmentV2'
-    [string]     $VendoredModulesPath,              # e.g., "$PSScriptRoot\Modules-ZT-Graph220"
+    [hashtable[]] $ModuleRequirement,
+    [string[]]   $PreloadModules,
+    [string]     $VendoredModulesPath,
 
     [switch] $InstallIfMissing,
     [switch] $EnableAutoload,
-    [string] $PwshPath,                             # auto-picks pwsh or powershell if omitted
-    [string] $WorkingDirectory,                     # starting directory inside the child
-    [switch] $KeepTemp                              # keep the generated temp .ps1 for inspection
+    [string] $PwshPath,
+    [string] $WorkingDirectory,
+    [switch] $KeepTemp
   )
 
   # Auto-select child host if not specified
