@@ -78,28 +78,6 @@
   Launches a brand-new PowerShell host (pwsh or powershell) with -NoProfile and executes the script.
   Honors your script’s #requires -Modules and/or any -ModuleRequirement pins you pass. Supports vendored
   module path, install-if-missing, and turns off autoload by default for determinism.
-.PARAMETER ScriptPath
-  Path to the .ps1 file to execute.
-.PARAMETER ScriptArgs
-  Array of arguments to pass to your script (tokens).
-.PARAMETER ModuleRequirement
-  Array of hashtables describing required modules and versions (exact or ranges).
-.PARAMETER ConflictPolicy
-  ScriptWins (default) or ExternalWins for merging #requires with ModuleRequirement.
-.PARAMETER VendoredModulesPath
-  Folder prepended to PSModulePath for the child (e.g., output of Save-Module).
-.PARAMETER InstallIfMissing
-  If set, Install-Module missing requirements to CurrentUser inside the child.
-.PARAMETER EnableAutoload
-  Allow automatic module autoloading in the child (default disabled).
-.PARAMETER IgnoreScriptRequires
-  Ignore #requires -Modules in the script and ONLY use -ModuleRequirement.
-.PARAMETER PwshPath
-  Host to launch. If omitted, auto-picks pwsh (7+) then powershell (5.1).
-.EXAMPLE
-  Invoke-IsolatedScript -ScriptPath .\Test-GraphAuth-230.ps1
-.EXAMPLE
-  Invoke-IsolatedScript -ScriptPath .\My.ps1 -VendoredModulesPath "$PSScriptRoot\Modules" -EnableAutoload
 #>
 function Invoke-IsolatedScript {
   [CmdletBinding()]
@@ -189,8 +167,17 @@ function Invoke-IsolatedScript {
 
   $child = @'
 $ErrorActionPreference = 'Stop'
-# Ensure no default param values (prevents things like Get-Date -Date $null)
-$PSDefaultParameterValues = @{}
+
+# Kill any default param values that could force Get-Date -Date $null
+function Reset-DefaultParams {
+  try {
+    foreach ($scope in 'Local','Script','Global') {
+      Set-Variable -Scope $scope -Name PSDefaultParameterValues -Value @{} -Force -ErrorAction SilentlyContinue
+    }
+    $ExecutionContext.SessionState.PSVariable.Set('PSDefaultParameterValues', @{})
+  } catch {}
+}
+Reset-DefaultParams
 
 $raw = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('__PAYLOAD__'))
 
@@ -275,9 +262,9 @@ if ($cfg.Requirements -and $cfg.Requirements.Count -gt 0) {
   foreach ($r in $cfg.Requirements) { Import-Exact $r }
 }
 
-# Run the target script (avoid the special $args; re-clear defaults)
+# Run the target script (avoid $args; re-clear defaults in *all* scopes)
 $argv = if ($cfg.ScriptArgs) { @($cfg.ScriptArgs) } else { @() }
-$PSDefaultParameterValues = @{}
+Reset-DefaultParams
 
 if ($argv.Count -gt 0) {
   & $cfg.ScriptPath @argv
@@ -337,8 +324,17 @@ function Invoke-IsolatedCommand {
 
   $child = @'
 $ErrorActionPreference = 'Stop'
-# Reset any default parameter values in this clean process
-$PSDefaultParameterValues = @{}
+
+# Kill any default param values that could force Get-Date -Date $null
+function Reset-DefaultParams {
+  try {
+    foreach ($scope in 'Local','Script','Global') {
+      Set-Variable -Scope $scope -Name PSDefaultParameterValues -Value @{} -Force -ErrorAction SilentlyContinue
+    }
+    $ExecutionContext.SessionState.PSVariable.Set('PSDefaultParameterValues', @{})
+  } catch {}
+}
+Reset-DefaultParams
 
 $raw = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('__PAYLOAD__'))
 
@@ -422,21 +418,21 @@ if ($cfg.PreloadMods -and $cfg.PreloadMods.Count -gt 0) {
   foreach ($m in $cfg.PreloadMods) { try { Import-Module $m -ErrorAction Stop } catch {} }
 }
 
-# Finally, run the command (with sanitized splat and no default params)
+# Finally, run the command (sanitize splat; re-clear defaults in *all* scopes)
 $cmd   = $cfg.CommandName
 $argv  = if ($cfg.CommandArgs) { @($cfg.CommandArgs) } else { @() }
 $splat = $cfg.CommandSplat
 
-# Drop null/empty entries from the splat
+# Drop null/empty splat entries
 $clean = @{}
 if ($splat -is [System.Collections.IDictionary]) {
   foreach ($k in $splat.Keys) {
     $v = $splat[$k]
-    if ($null -ne $v -and -not ($v -is [string] -and $v.Trim() -eq '')) {
-      $clean[$k] = $v
-    }
+    if ($null -ne $v -and -not ($v -is [string] -and $v.Trim() -eq '')) { $clean[$k] = $v }
   }
 }
+
+Reset-DefaultParams
 
 if ($clean.Count -gt 0) {
   & $cmd @clean
