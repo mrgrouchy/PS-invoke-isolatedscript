@@ -31,7 +31,7 @@
   # --- Run a .ps1, honoring its #requires -Modules ---
   Invoke-IsolatedScript -ScriptPath .\MyScript.ps1
 
-  # --- Run a .ps1 but pin Graph.Auth exactly (no bleed) ---
+  # --- Pin Graph.Auth exactly (no bleed) ---
   Invoke-IsolatedScript -ScriptPath .\MyScript.ps1 `
     -ModuleRequirement @(@{ Name='Microsoft.Graph.Authentication'; RequiredVersion='2.31.0' })
 
@@ -39,13 +39,13 @@
   $vend = "$PSScriptRoot\Modules"
   Invoke-IsolatedScript -ScriptPath .\MyScript.ps1 -VendoredModulesPath $vend -EnableAutoload
 
-  # --- Run a single command (no .ps1): Invoke-ZTAssessment with Graph.Auth 2.2.0 and a switch ---
+  # --- Single command: Invoke-ZTAssessment with Graph.Auth 2.2.0 and a switch ---
   Invoke-IsolatedCommand -CommandName Invoke-ZTAssessment `
     -PreloadModules @('ZeroTrustAssessmentV2') -EnableAutoload `
     -ModuleRequirement @(@{ Name='Microsoft.Graph.Authentication'; RequiredVersion='2.2.0' }) `
     -CommandSplat @{ Interactive = $true; Days = 1 }
 
-  # --- Connect-MgGraph (device code), inside isolated child, then exit (single command) ---
+  # --- Connect-MgGraph (device code) inside an isolated child ---
   Invoke-IsolatedCommand -CommandName Connect-MgGraph `
     -EnableAutoload `
     -ModuleRequirement @(@{ Name='Microsoft.Graph.Authentication'; RequiredVersion='2.2.0' }) `
@@ -84,9 +84,6 @@
   Array of arguments to pass to your script (tokens).
 .PARAMETER ModuleRequirement
   Array of hashtables describing required modules and versions (exact or ranges).
-  Examples:
-    @{ Name='Microsoft.Graph.Authentication'; RequiredVersion='2.2.0' }
-    @{ Name='PnP.PowerShell'; MinimumVersion='2.4.0' }
 .PARAMETER ConflictPolicy
   ScriptWins (default) or ExternalWins for merging #requires with ModuleRequirement.
 .PARAMETER VendoredModulesPath
@@ -122,12 +119,10 @@ function Invoke-IsolatedScript {
     throw "Script not found: $ScriptPath"
   }
 
-  # Auto-select child host if caller didn’t specify one (pwsh → fallback to powershell 5.1)
   if (-not $PSBoundParameters.ContainsKey('PwshPath')) {
     if (Get-Command pwsh -ErrorAction SilentlyContinue) { $PwshPath = 'pwsh' } else { $PwshPath = 'powershell' }
   }
 
-  # Parse #requires -Modules from the script
   function Get-RequiresModules {
     param([string]$Path)
     $text = Get-Content -LiteralPath $Path -Raw
@@ -146,7 +141,7 @@ function Invoke-IsolatedScript {
           $maxv = ([regex]::Match($p, "(?is)MaximumVersion\s*=\s*['""]?([^'"";]+)")).Groups[1].Value.Trim()
           if ($name) {
             $h = @{ Name = $name }
-            if ($reqv) { $h.RequiredVersion = $reqv }   # treat as exact pin
+            if ($reqv) { $h.RequiredVersion = $reqv }
             if ($minv) { $h.MinimumVersion  = $minv }
             if ($maxv) { $h.MaximumVersion  = $maxv }
             $reqs += $h
@@ -162,10 +157,8 @@ function Invoke-IsolatedScript {
     ,$reqs
   }
 
-  # 1) Collect requirements
   $scriptReqs = if ($IgnoreScriptRequires) { @() } else { Get-RequiresModules -Path $ScriptPath }
 
-  # 2) Merge with external per ConflictPolicy
   $byName = @{}
   foreach ($r in $scriptReqs) { $byName[$r.Name] = $r }
 
@@ -181,7 +174,6 @@ function Invoke-IsolatedScript {
   $finalReqs = New-Object System.Collections.Generic.List[object]
   foreach ($v in $byName.Values) { [void]$finalReqs.Add($v) }
 
-  # 3) Build payload for the child
   $resolvedScript = (Resolve-Path -LiteralPath $ScriptPath).Path
   if ($null -eq $ScriptArgs) { $ScriptArgs = @() }
 
@@ -195,10 +187,9 @@ function Invoke-IsolatedScript {
   } | ConvertTo-Json -Depth 8 -Compress
   $payloadEnc = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($payload))
 
-  # 4) Child bootstrap (single-quoted; replace token to avoid premature expansion)
   $child = @'
 $ErrorActionPreference = 'Stop'
-# Reset any default parameter values in this clean process
+# Ensure no default param values (prevents things like Get-Date -Date $null)
 $PSDefaultParameterValues = @{}
 
 $raw = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('__PAYLOAD__'))
@@ -217,15 +208,10 @@ function ConvertTo-HashtableDeep($input) {
   return $input
 }
 
-try {
-  $cfg = $raw | ConvertFrom-Json -AsHashtable
-} catch {
-  $cfg = ConvertTo-HashtableDeep ($raw | ConvertFrom-Json)
-}
+try { $cfg = $raw | ConvertFrom-Json -AsHashtable } catch { $cfg = ConvertTo-HashtableDeep ($raw | ConvertFrom-Json) }
 
 if (-not $cfg.Autoload) { $PSModuleAutoloadingPreference = 'None' }
 
-# Ensure core cmdlets even with autoload off
 try { Import-Module Microsoft.PowerShell.Management -ErrorAction Stop } catch {}
 try { Import-Module Microsoft.PowerShell.Utility    -ErrorAction Stop } catch {}
 
@@ -237,28 +223,23 @@ function Import-Exact([hashtable]$r) {
   $name = $r.Name
   if (-not $name) { throw 'Requirement missing Name' }
 
-  # Exact pin (RequiredVersion or ModuleVersion)
   $ver = if ($r.ContainsKey('RequiredVersion')) { $r.RequiredVersion } elseif ($r.ContainsKey('ModuleVersion')) { $r.ModuleVersion } else { $null }
 
   if ($ver) {
-    # Import the specific manifest/module path for that version
     $target = Get-Module -ListAvailable -Name $name |
               Where-Object { $_.Version -eq [version]$ver } |
               Select-Object -First 1
     if (-not $target) { throw "Requested $name $ver not found on PSModulePath." }
     Import-Module -Name $target.Path -Force -ErrorAction Stop
-  }
-  elseif ($r.MinimumVersion -or $r.MaximumVersion) {
+  } elseif ($r.MinimumVersion -or $r.MaximumVersion) {
     $p = @{}
     if ($r.MinimumVersion) { $p.MinimumVersion = $r.MinimumVersion }
     if ($r.MaximumVersion) { $p.MaximumVersion = $r.MaximumVersion }
     Import-Module $name @p -ErrorAction Stop
-  }
-  else {
+  } else {
     Import-Module $name -ErrorAction Stop
   }
 
-  # Verify the loaded version satisfies the constraint
   $loaded = Get-Module -Name $name | Select-Object -First 1
   if (-not $loaded) { throw "Failed to import module $name" }
   if ($r.ContainsKey('RequiredVersion') -and $loaded.Version -ne [version]$r.RequiredVersion) { throw "Loaded $name $($loaded.Version), wanted $($r.RequiredVersion)" }
@@ -267,7 +248,6 @@ function Import-Exact([hashtable]$r) {
   if ($r.MaximumVersion -and $loaded.Version -gt [version]$r.MaximumVersion)                   { throw "Loaded $name $($loaded.Version) > max $($r.MaximumVersion)" }
 }
 
-# Optional install step
 if ($cfg.Install -and $cfg.Requirements -and $cfg.Requirements.Count -gt 0) {
   try { Import-Module PowerShellGet -ErrorAction Stop } catch {}
   foreach ($r in $cfg.Requirements) {
@@ -287,19 +267,18 @@ if ($cfg.Install -and $cfg.Requirements -and $cfg.Requirements.Count -gt 0) {
     } else {
       $need = -not (Get-Module -ListAvailable -Name $name)
     }
-    if ($need) {
-      Install-Module -Name $name -Scope CurrentUser -Force -AllowClobber | Out-Null
-    }
+    if ($need) { Install-Module -Name $name -Scope CurrentUser -Force -AllowClobber | Out-Null }
   }
 }
 
-# Preload & verify requirements to avoid wrong autoloads
 if ($cfg.Requirements -and $cfg.Requirements.Count -gt 0) {
   foreach ($r in $cfg.Requirements) { Import-Exact $r }
 }
 
-# Run the target script (avoid the special $args auto-variable)
+# Run the target script (avoid the special $args; re-clear defaults)
 $argv = if ($cfg.ScriptArgs) { @($cfg.ScriptArgs) } else { @() }
+$PSDefaultParameterValues = @{}
+
 if ($argv.Count -gt 0) {
   & $cfg.ScriptPath @argv
 } else {
@@ -309,7 +288,6 @@ if ($argv.Count -gt 0) {
 
   $child = $child.Replace('__PAYLOAD__', $payloadEnc)
 
-  # Launch child
   $childEnc = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($child))
   & $PwshPath -NoLogo -NoProfile -ExecutionPolicy Bypass -EncodedCommand $childEnc
 }
@@ -320,33 +298,6 @@ if ($argv.Count -gt 0) {
 .DESCRIPTION
   Launches a brand-new PowerShell host (pwsh or powershell) with -NoProfile, optionally pins module versions,
   preloads modules, and then invokes the command. Use -CommandSplat for unambiguous parameter passing.
-.PARAMETER CommandName
-  The command to run (e.g., Connect-MgGraph, Invoke-ZTAssessment).
-.PARAMETER CommandArgs
-  Array of tokens (strings) to pass positionally (e.g., @('-Interactive','-Days','1')).
-.PARAMETER CommandSplat
-  Hashtable of parameters to splat to the command (recommended).
-.PARAMETER ModuleRequirement
-  Array of hashtables describing modules to pin (exact or ranges).
-.PARAMETER PreloadModules
-  Modules to Import-Module before running the command (load-order control).
-.PARAMETER VendoredModulesPath
-  Folder prepended to PSModulePath for the child (e.g., a Save-Module cache).
-.PARAMETER InstallIfMissing
-  Install missing requirements to CurrentUser inside the child.
-.PARAMETER EnableAutoload
-  Allow automatic module autoloading in the child (default disabled).
-.PARAMETER PwshPath
-  Host to launch. If omitted, auto-picks pwsh (7+) then powershell (5.1).
-.PARAMETER WorkingDirectory
-  Starting directory inside the child process.
-.EXAMPLE
-  Invoke-IsolatedCommand -CommandName Invoke-ZTAssessment `
-    -PreloadModules @('ZeroTrustAssessmentV2') -EnableAutoload `
-    -ModuleRequirement @(@{ Name='Microsoft.Graph.Authentication'; RequiredVersion='2.2.0' }) `
-    -CommandSplat @{ Interactive = $true; Days = 1 }
-.EXAMPLE
-  Invoke-IsolatedCommand -CommandName Get-Date -CommandArgs @('-Format','o')
 #>
 function Invoke-IsolatedCommand {
   [CmdletBinding()]
@@ -363,7 +314,6 @@ function Invoke-IsolatedCommand {
     [string] $WorkingDirectory
   )
 
-  # Auto-select child host if not specified
   if (-not $PSBoundParameters.ContainsKey('PwshPath')) {
     if (Get-Command pwsh -ErrorAction SilentlyContinue) { $PwshPath = 'pwsh' } else { $PwshPath = 'powershell' }
   }
@@ -387,6 +337,8 @@ function Invoke-IsolatedCommand {
 
   $child = @'
 $ErrorActionPreference = 'Stop'
+# Reset any default parameter values in this clean process
+$PSDefaultParameterValues = @{}
 
 $raw = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('__PAYLOAD__'))
 
@@ -402,7 +354,6 @@ try { $cfg = $raw | ConvertFrom-Json -AsHashtable } catch { $cfg = ConvertTo-Has
 
 if (-not $cfg.Autoload) { $PSModuleAutoloadingPreference = 'None' }
 
-# Ensure core cmdlets even with autoload off
 try { Import-Module Microsoft.PowerShell.Management -ErrorAction Stop } catch {}
 try { Import-Module Microsoft.PowerShell.Utility    -ErrorAction Stop } catch {}
 
@@ -424,14 +375,12 @@ function Import-Exact([hashtable]$r) {
               Select-Object -First 1
     if (-not $target) { throw "Requested $name $ver not found on PSModulePath." }
     Import-Module -Name $target.Path -Force -ErrorAction Stop
-  }
-  elseif ($r.MinimumVersion -or $r.MaximumVersion) {
+  } elseif ($r.MinimumVersion -or $r.MaximumVersion) {
     $p = @{}
     if ($r.MinimumVersion) { $p.MinimumVersion = $r.MinimumVersion }
     if ($r.MaximumVersion) { $p.MaximumVersion = $r.MaximumVersion }
     Import-Module $name @p -ErrorAction Stop
-  }
-  else {
+  } else {
     Import-Module $name -ErrorAction Stop
   }
 
@@ -443,7 +392,6 @@ function Import-Exact([hashtable]$r) {
   if ($r.MaximumVersion -and $loaded.Version -gt [version]$r.MaximumVersion)                   { throw "Loaded $name $($loaded.Version) > max $($r.MaximumVersion)" }
 }
 
-# Optional install of missing requirements
 if ($cfg.Install -and $cfg.Requirements -and $cfg.Requirements.Count -gt 0) {
   try { Import-Module PowerShellGet -ErrorAction Stop } catch {}
   foreach ($r in $cfg.Requirements) {
@@ -463,13 +411,10 @@ if ($cfg.Install -and $cfg.Requirements -and $cfg.Requirements.Count -gt 0) {
     } else {
       $need = -not (Get-Module -ListAvailable -Name $name)
     }
-    if ($need) {
-      Install-Module -Name $name -Scope CurrentUser -Force -AllowClobber | Out-Null
-    }
+    if ($need) { Install-Module -Name $name -Scope CurrentUser -Force -AllowClobber | Out-Null }
   }
 }
 
-# Pin/import requested modules FIRST, then preload any other module(s)
 if ($cfg.Requirements -and $cfg.Requirements.Count -gt 0) {
   foreach ($r in $cfg.Requirements) { Import-Exact $r }
 }
@@ -477,15 +422,12 @@ if ($cfg.PreloadMods -and $cfg.PreloadMods.Count -gt 0) {
   foreach ($m in $cfg.PreloadMods) { try { Import-Module $m -ErrorAction Stop } catch {} }
 }
 
-# Finally, run the command (with sanitized splat)
-# Prevent inherited default params from forcing things like Get-Date -Date $null
-$PSDefaultParameterValues = @{}
-
+# Finally, run the command (with sanitized splat and no default params)
 $cmd   = $cfg.CommandName
 $argv  = if ($cfg.CommandArgs) { @($cfg.CommandArgs) } else { @() }
 $splat = $cfg.CommandSplat
 
-# Drop null / empty entries from the splat to avoid binding errors like: Get-Date -Date $null
+# Drop null/empty entries from the splat
 $clean = @{}
 if ($splat -is [System.Collections.IDictionary]) {
   foreach ($k in $splat.Keys) {
@@ -516,34 +458,6 @@ if ($clean.Count -gt 0) {
 .DESCRIPTION
   Writes a temporary .ps1 with your statements, then calls Invoke-IsolatedScript so all version
   pinning and vendored path logic applies. Perfect for: Connect-MgGraph then Invoke-ZTAssessment.
-.PARAMETER Statements
-  Array of lines (strings) to execute in order in the child.
-.PARAMETER ModuleRequirement
-  Array of hashtables describing modules to pin (exact or ranges).
-.PARAMETER PreloadModules
-  Modules to Import-Module before running your statements.
-.PARAMETER VendoredModulesPath
-  Folder prepended to PSModulePath for the child (e.g., a Save-Module cache).
-.PARAMETER InstallIfMissing
-  Install missing requirements to CurrentUser inside the child.
-.PARAMETER EnableAutoload
-  Allow automatic module autoloading in the child (default disabled).
-.PARAMETER PwshPath
-  Host to launch. If omitted, auto-picks pwsh (7+) then powershell (5.1).
-.PARAMETER WorkingDirectory
-  Starting directory inside the child process.
-.PARAMETER KeepTemp
-  If set, keep the generated temp .ps1 (path is written to output).
-.EXAMPLE
-  Invoke-IsolatedSequence `
-    -Statements @(
-      "Connect-MgGraph -UseDeviceCode -Scopes 'User.Read.All' -TenantId 'contoso.onmicrosoft.com' -ContextScope Process",
-      "Invoke-ZTAssessment -Interactive -Days 1"
-    ) `
-    -VendoredModulesPath "$PSScriptRoot\Modules-ZT-Graph220" `
-    -PreloadModules @('ZeroTrustAssessmentV2') `
-    -EnableAutoload `
-    -ModuleRequirement @(@{ Name='Microsoft.Graph.Authentication'; RequiredVersion='2.2.0' })
 #>
 function Invoke-IsolatedSequence {
   [CmdletBinding()]
@@ -562,12 +476,10 @@ function Invoke-IsolatedSequence {
     [switch] $KeepTemp
   )
 
-  # Auto-select child host if not specified
   if (-not $PSBoundParameters.ContainsKey('PwshPath')) {
     if (Get-Command pwsh -ErrorAction SilentlyContinue) { $PwshPath = 'pwsh' } else { $PwshPath = 'powershell' }
   }
 
-  # Build the temporary script
   $tmp = Join-Path ([IO.Path]::GetTempPath()) ("iso-seq-" + [guid]::NewGuid().ToString('N') + ".ps1")
   $utf8NoBom = New-Object System.Text.UTF8Encoding($false)
 
